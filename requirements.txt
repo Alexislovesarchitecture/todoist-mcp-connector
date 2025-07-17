@@ -1,4 +1,4 @@
-fastmcp==2.5.2
-todoist-api-python==8.2.0
-python-dotenv==1.1.0
-uvicorn==0.34.3
+fastmcp>=0.1.6      # Thin wrapper that registers the two tools & starts an SSE or JSON server
+httpx>=0.27         # Async HTTP client for calling the Todoist REST API
+pydantic>=2.8       # Type modelling / validation
+uvicorn>=0.29       # ASGI server used internally by FastMCP
