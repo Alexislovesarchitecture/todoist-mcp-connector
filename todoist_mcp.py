@@ -1,121 +1,240 @@
 """
-Minimal Deep‑Research MCP connector for Todoist
-----------------------------------------------
+Todoist Deep‑Research MCP Connector
+===================================
 
-* Exposes exactly two tools:  search  and  fetch
-* Uses Todoist REST API v2 (https://developer.todoist.com/rest/v2/)
-* Looks at Tasks **and** Projects (per your scope)
-* Requires a Fly.io secret called  TODOIST_TOKEN  (personal or service‑account)
+This module implements the two required tools for a ChatGPT
+Deep‑Research connector: `search` and `fetch`. It interacts with
+Todoist’s REST API to surface tasks and projects for retrieval.
+
+Key features:
+
+* Handles both tasks and projects in search results, capped at 10 items.
+* Quotes multi‑word queries to satisfy Todoist’s search filter syntax.
+* Deduplicates IDs across tasks and projects.
+* Provides extra metadata (due date, priority, labels) in fetch results.
+* Adds CORS support for ChatGPT’s browser client and a simple `/health`
+  endpoint for Fly.io health checks.
+
+Environment variables:
+
+* `TODOIST_TOKEN` (required): Personal or service account token.
+* `PORT` (optional): Port to bind the server; defaults to 8000.
+
+Run locally with:
+
+    python todoist_mcp.py
+
+The server binds to all interfaces and uses SSE transport by default.
 """
 
 import os
-import asyncio
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from pydantic import BaseModel, Field
 from fastmcp import FastMCP, Tool
+from fastapi.middleware.cors import CORSMiddleware
 
-# --------------------------------------------------------------------------- #
-# Pydantic models that match the Deep‑Research spec
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Pydantic models adhering to the Deep‑Research specification
+# ---------------------------------------------------------------------------
+
 
 class SearchRequest(BaseModel):
+    """Request body for the search tool: a free‑text query."""
+
     query: str = Field(..., description="Free‑text search string")
 
+
 class Snippet(BaseModel):
+    """Represents a short search result returned to ChatGPT."""
+
     id: str
     title: str
-    text: str          # ≈200‑char snippet
+    text: str  # ≈200‑char snippet
     url: str
+
 
 class FetchRequest(BaseModel):
+    """Request body for the fetch tool: an ID previously returned by search."""
+
     id: str = Field(..., description="Identifier returned from search")
 
+
 class Doc(BaseModel):
+    """Full document returned by the fetch tool."""
+
     id: str
     title: str
-    text: str          # full content
+    text: str  # full content
     url: str
-    metadata: Optional[dict] = None
+    metadata: Optional[Dict] = None
 
 
-# --------------------------------------------------------------------------- #
-# FastMCP application
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Application initialization
+# ---------------------------------------------------------------------------
 
 app = FastMCP(
     title="Todoist Deep‑Research Connector",
-    version="0.1.0",
-    description="Search and fetch Todoist tasks & projects using Deep Research",
+    version="0.2.0",
+    description="Search and fetch Todoist tasks & projects using the Deep Research protocol",
 )
 
+# Enable cross‑origin requests from any origin. This is required for
+# ChatGPT’s browser client to consume Server‑Sent Events.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 TODOIST_BASE = "https://api.todoist.com/rest/v2"
-TOKEN = os.getenv("TODOIST_TOKEN")
-HEADERS = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
 
-# Helper -------------------------------------------------------------------- #
 
-async def _get(client: httpx.AsyncClient, url: str, **kwargs):
-    resp = await client.get(url, headers=HEADERS, timeout=10, **kwargs)
+def get_token_and_headers() -> Tuple[str, Dict[str, str]]:
+    """Retrieve the Todoist token from the environment and return headers.
+
+    Raises:
+        RuntimeError: if the token is missing.
+    """
+
+    token = os.getenv("TODOIST_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "TODOIST_TOKEN environment variable is missing. Set it via fly secrets or your shell."
+        )
+    return token, {"Authorization": f"Bearer {token}"}
+
+
+async def http_get(client: httpx.AsyncClient, url: str, headers: Dict[str, str], **params) -> dict:
+    """Perform a GET request with the provided headers and query parameters.
+
+    Args:
+        client: The httpx client to use.
+        url: The full URL to fetch.
+        headers: Authorization headers.
+        **params: Additional keyword arguments passed to httpx.get (e.g., params).
+
+    Returns:
+        Parsed JSON response as a Python dict or list.
+    """
+
+    resp = await client.get(url, headers=headers, timeout=10, params=params)
     resp.raise_for_status()
     return resp.json()
 
-# Tool: search -------------------------------------------------------------- #
+
+def make_task_snippet(task: dict) -> Snippet:
+    """Construct a search result snippet from a Todoist task object."""
+
+    title = task.get("content", "")
+    due = task.get("due", {}) or {}
+    due_date = due.get("date")
+    priority = task.get("priority")
+    snippet = f"{title}"
+    if due_date or priority:
+        parts = []
+        if due_date:
+            parts.append(f"due: {due_date}")
+        if priority:
+            parts.append(f"priority: {priority}")
+        snippet += " (" + ", ".join(parts) + ")"
+    return Snippet(
+        id=f"task:{task['id']}",
+        title=title,
+        text=snippet[:200],
+        url=f"https://todoist.com/showTask?id={task['id']}",
+    )
+
+
+def make_project_snippet(project: dict) -> Snippet:
+    """Construct a search result snippet from a Todoist project object."""
+
+    name = project.get("name", "")
+    return Snippet(
+        id=f"project:{project['id']}",
+        title=name,
+        text=("Project • " + name)[:200],
+        url=f"https://todoist.com/showProject?id={project['id']}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
 
 @app.tool(
     Tool(
         name="search",
         request=SearchRequest,
         response=List[Snippet],
-        description="Search Todoist tasks and projects by text",
+        description="Search Todoist tasks and projects by free‑text query",
     )
 )
 async def search(req: SearchRequest) -> List[Snippet]:
-    if not TOKEN:
-        raise RuntimeError("TODOIST_TOKEN env var is missing")
+    """Search tasks and projects in Todoist matching the query string.
 
-    query = req.query.lower()
-    snippets: List[Snippet] = []
+    The function returns up to 10 unique results. A result ID is
+    prefixed with `task:` or `project:` so that `fetch` can look up
+    the appropriate resource.
+    """
+
+    _, headers = get_token_and_headers()
+
+    query = req.query.strip()
+    if not query:
+        return []
+
+    results: List[Snippet] = []
+    seen_ids: Set[str] = set()
+
+    # Quote the query if it contains whitespace to satisfy Todoist filter syntax
+    search_filter = f'search: "{query}"' if " " in query else f"search: {query}"
 
     async with httpx.AsyncClient() as client:
-        # -- Tasks -----------------------------------------------------------
-        tasks = await _get(client, f"{TODOIST_BASE}/tasks", params={"filter": f"search: {req.query}"})
-        for t in tasks:
-            if len(snippets) >= 10:
+        # Fetch tasks matching the search filter
+        tasks = await http_get(
+            client,
+            f"{TODOIST_BASE}/tasks",
+            headers,
+            filter=search_filter,
+        )
+        for task in tasks:
+            if len(results) >= 10:
                 break
-            title = t["content"]
-            if query in title.lower():
-                snippet_text = f"{title}  (due: {t.get('due', {}).get('date')}, priority: {t['priority']})"
-                snippets.append(
-                    Snippet(
-                        id=f"task:{t['id']}",
-                        title=title,
-                        text=snippet_text[:200],
-                        url=f"https://todoist.com/showTask?id={t['id']}",
-                    )
-                )
+            snippet = make_task_snippet(task)
+            if snippet.id not in seen_ids:
+                results.append(snippet)
+                seen_ids.add(snippet.id)
 
-        # -- Projects --------------------------------------------------------
-        if len(snippets) < 10:
-            projects = await _get(client, f"{TODOIST_BASE}/projects")
-            for p in projects:
-                if len(snippets) >= 10:
+        # Fetch projects only if we have capacity for more results
+        if len(results) < 10:
+            projects = await http_get(
+                client,
+                f"{TODOIST_BASE}/projects",
+                headers,
+            )
+            for project in projects:
+                if len(results) >= 10:
                     break
-                name = p["name"]
-                if query in name.lower():
-                    snippets.append(
-                        Snippet(
-                            id=f"project:{p['id']}",
-                            title=name,
-                            text=f"Project • {name}"[:200],
-                            url=f"https://todoist.com/showProject?id={p['id']}",
-                        )
-                    )
+                # Basic substring match on project name
+                if query.lower() in project.get("name", "").lower():
+                    snippet = make_project_snippet(project)
+                    if snippet.id not in seen_ids:
+                        results.append(snippet)
+                        seen_ids.add(snippet.id)
 
-    return snippets
+    return results
 
-# Tool: fetch --------------------------------------------------------------- #
 
 @app.tool(
     Tool(
@@ -126,32 +245,53 @@ async def search(req: SearchRequest) -> List[Snippet]:
     )
 )
 async def fetch(req: FetchRequest) -> Doc:
-    if not TOKEN:
-        raise RuntimeError("TODOIST_TOKEN env var is missing")
+    """Fetch full details for a given task or project ID.
 
-    kind, raw_id = req.id.split(":", 1)
+    Supports IDs returned by `search` in the form `task:<id>` or
+    `project:<id>`. Raises ValueError if the prefix is unknown.
+    """
+
+    _, headers = get_token_and_headers()
+
+    # Split the prefix and numeric ID
+    try:
+        kind, raw_id = req.id.split(":", 1)
+    except ValueError:
+        raise ValueError("id must be in the format 'task:<id>' or 'project:<id>'")
+
     async with httpx.AsyncClient() as client:
         if kind == "task":
-            data = await _get(client, f"{TODOIST_BASE}/tasks/{raw_id}")
+            data = await http_get(
+                client,
+                f"{TODOIST_BASE}/tasks/{raw_id}",
+                headers,
+            )
             labels = data.get("labels", [])
+            due = data.get("due")
+            priority = data.get("priority")
+            project_id = data.get("project_id")
             doc = Doc(
                 id=req.id,
-                title=data["content"],
-                text=data["content"],
+                title=data.get("content", ""),
+                text=data.get("content", ""),
                 url=f"https://todoist.com/showTask?id={raw_id}",
                 metadata={
-                    "due": data.get("due"),
-                    "priority": data["priority"],
+                    "due": due,
+                    "priority": priority,
                     "labels": labels,
-                    "project_id": data["project_id"],
+                    "project_id": project_id,
                 },
             )
         elif kind == "project":
-            data = await _get(client, f"{TODOIST_BASE}/projects/{raw_id}")
+            data = await http_get(
+                client,
+                f"{TODOIST_BASE}/projects/{raw_id}",
+                headers,
+            )
             doc = Doc(
                 id=req.id,
-                title=data["name"],
-                text=data.get("description") or data["name"],
+                title=data.get("name", ""),
+                text=data.get("description") or data.get("name", ""),
                 url=f"https://todoist.com/showProject?id={raw_id}",
                 metadata={
                     "color": data.get("color"),
@@ -159,13 +299,32 @@ async def fetch(req: FetchRequest) -> Doc:
                 },
             )
         else:
-            raise ValueError("id must start with 'task:' or 'project:'")
+            raise ValueError("Unknown resource type; id must start with 'task:' or 'project:'")
     return doc
 
-# --------------------------------------------------------------------------- #
-# Entrypoint – default to SSE, which ChatGPT handles natively
-# --------------------------------------------------------------------------- #
+
+# ---------------------------------------------------------------------------
+# Additional routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    """Health check endpoint for Fly.io.
+
+    Returns a simple JSON object. If this route returns a non‑2xx
+    response, Fly will mark the instance as unhealthy.
+    """
+
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # FastMCP’s .run() wraps a Uvicorn server under the hood
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)), transport="sse")
+    # Bind to the port provided by the environment (Fly injects PORT)
+    port = int(os.getenv("PORT", 8000))
+    # SSE is the default transport recommended by OpenAI.
+    app.run(host="0.0.0.0", port=port, transport="sse")

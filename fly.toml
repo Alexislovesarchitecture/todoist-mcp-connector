@@ -1,0 +1,70 @@
+# fly.toml – Fly.io deployment configuration for the Todoist MCP
+#
+# This file tells Fly.io how to build and run your application.
+# It can be generated automatically by `fly launch`, but providing
+# an initial version helps you understand and customise the deployment.
+
+# Change this to the name of your Fly app (must be globally unique).
+app = "todoist-mcp-connector"
+
+# Fly chooses a region automatically if you omit this, but you may
+# specify a preferred region closer to you or your users (e.g. sea, lax, ord).
+# See https://fly.io/docs/about/regions/ for available codes.
+primary_region = "lax"
+
+# When Fly stops your app it will send SIGINT and wait up to
+# `kill_timeout` seconds before force killing the process. FastMCP
+# gracefully handles SIGINT.
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[env]
+  # FastMCP reads this port from the environment. Fly also injects
+  # PORT automatically, but specifying it here clarifies intent for
+  # local Docker runs.
+  PORT = "8000"
+
+# You can specify a prebuilt Docker image here instead of a Dockerfile
+# by uncommenting the `image` line and providing the image name.
+[build]
+  # image = "ghcr.io/your-name/todoist-mcp:latest"
+
+[[services]]
+  # The port your application listens on inside the container.
+  internal_port = 8000
+  protocol = "tcp"
+
+  # Define how external HTTP(s) traffic is routed. Fly automatically
+  # provisions a TLS certificate on port 443. Handlers tell Fly to
+  # perform HTTP/1.1 termination and TLS offload.
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  # Optional HTTP health check. When enabled, Fly pings the path
+  # periodically and only routes traffic once it returns 2xx. Without
+  # this section Fly falls back to a simple TCP port check.
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "get"
+    path = "/health"
+
+  # Concurrency tuning. This prevents Fly from sending more than
+  # `hard_limit` simultaneous requests to a single instance. Adjust
+  # depending on your CPU/memory and expected traffic. Remove this
+  # block for default behaviour.
+  [services.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+  # Disable response compression for SSE. Without this, Fly may
+  # buffer SSE events, resulting in delayed streaming to ChatGPT. If
+  # compression is enabled in the future, you can override it here.
+  [services.ports.http_options]
+    compress = false
