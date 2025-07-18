@@ -30,10 +30,11 @@ The server binds to all interfaces and uses SSE transport by default.
 import os
 from typing import Dict, List, Optional, Set, Tuple
 
-import httpx
-from pydantic import BaseModel, Field
-from fastmcp import FastMCP, Tool
-from fastapi.middleware.cors import CORSMiddleware
+import httpx  # type: ignore
+from pydantic import BaseModel, Field  # type: ignore
+from fastmcp import FastMCP  # type: ignore
+from fastmcp.tools import Tool  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models adhering to the Deep‑Research specification
@@ -76,20 +77,11 @@ class Doc(BaseModel):
 # ---------------------------------------------------------------------------
 
 app = FastMCP(
-    title="Todoist Deep‑Research Connector",
-    version="0.2.0",
-    description="Search and fetch Todoist tasks & projects using the Deep Research protocol",
+    name="Todoist Deep-Research Connector",
+    instructions="Search and fetch Todoist tasks & projects using the Deep Research protocol",
 )
 
-# Enable cross‑origin requests from any origin. This is required for
-# ChatGPT’s browser client to consume Server‑Sent Events.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 
 # ---------------------------------------------------------------------------
