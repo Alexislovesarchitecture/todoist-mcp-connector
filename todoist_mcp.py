@@ -34,8 +34,65 @@ import httpx  # type: ignore
 from pydantic import BaseModel, Field  # type: ignore
 from fastmcp import FastMCP  # type: ignore
 from fastmcp.tools import Tool  # type: ignore
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+import json, yaml, pathlib
+from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+# ---------------------------------------------------------------------------
+# Application initialization
+# ---------------------------------------------------------------------------
 
+app = FastMCP(
+    name="Todoist Deep-Research Connector",
+    instructions="Search and fetch Todoist tasks & projects using the Deep Research protocol",
+)
 
+# ------------------------------------------------------------
+# Expose FastMCP's generated OpenAPI + plugin manifest
+# ------------------------------------------------------------
+
+STATIC_DIR = pathlib.Path("static")
+STATIC_DIR.mkdir(exist_ok=True)
+(STATIC_DIR / ".well-known").mkdir(parents=True, exist_ok=True)
+
+# ❶ Dump OpenAPI once at startup
+spec_path = STATIC_DIR / "openapi.yaml"
+spec_yaml = yaml.safe_dump(app.fastapi_app.openapi(), sort_keys=False)
+spec_path.write_text(spec_yaml)
+
+# ❷ Write the manifest
+manifest = {
+    "schema_version": "v1",
+    "name_for_human": "Todoist MCP Connector",
+    "name_for_model": "todoist_mcp",
+    "description_for_human": "Search & fetch your Todoist tasks from ChatGPT.",
+    "description_for_model": "Provides `search` and `fetch` tools for Todoist data.",
+    "auth": {"type": "none"},
+    "api": {"type": "openapi", "url": "https://todoist-mcp-connector.fly.dev/openapi.yaml"},
+    "logo_url": "https://todoist-mcp-connector.fly.dev/logo.png",
+    "contact_email": "you@example.com",
+    "legal_info_url": "https://example.com/legal"
+}
+manifest_path = STATIC_DIR / ".well-known" / "ai-plugin.json"
+manifest_path.write_text(json.dumps(manifest, indent=2))
+
+# ❸ CORS so ChatGPT’s browser client can call the server
+app.fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ❹ Routes that serve the two static files
+@app.get("/.well-known/ai-plugin.json")
+def serve_manifest():
+    return FileResponse(manifest_path)
+
+@app.get("/openapi.yaml")
+def serve_openapi():
+    return PlainTextResponse(spec_yaml, media_type="text/yaml")
 # ---------------------------------------------------------------------------
 # Pydantic models adhering to the Deep‑Research specification
 # ---------------------------------------------------------------------------
@@ -70,18 +127,6 @@ class Doc(BaseModel):
     text: str  # full content
     url: str
     metadata: Optional[Dict] = None
-
-
-# ---------------------------------------------------------------------------
-# Application initialization
-# ---------------------------------------------------------------------------
-
-app = FastMCP(
-    name="Todoist Deep-Research Connector",
-    instructions="Search and fetch Todoist tasks & projects using the Deep Research protocol",
-)
-
-
 
 
 # ---------------------------------------------------------------------------
