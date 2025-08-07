@@ -1,274 +1,197 @@
-"""
-Todoist Deep‑Research MCP Connector
-===================================
-
-Implements the two required tools (`search`, `fetch`) for a ChatGPT
-Deep‑Research connector. Interacts with Todoist’s REST API to surface
-tasks and projects.
-
-Run locally with:
-    python todoist_mcp.py
-"""
-
 import os
-import json
-import yaml
-import pathlib
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
-import httpx  # type: ignore
-from pydantic import BaseModel, Field  # type: ignore
-from fastmcp import FastMCP  # type: ignore
-from fastmcp.tools import Tool  # type: ignore
-from fastapi.responses import FileResponse, PlainTextResponse
+import httpx
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastmcp import FastMCP, Tool
+from pydantic import BaseModel, Field
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App initialization
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------- Config ----------
+TODOIST_TOKEN = os.getenv("TODOIST_TOKEN")
+if not TODOIST_TOKEN:
+    # Fail fast in cloud so health checks surface a clear reason
+    raise RuntimeError("Missing TODOIST_TOKEN environment variable")
 
+BASE_URL = "https://api.todoist.com/rest/v2"
+HEADERS = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+
+# ---------- Models required by Deep Research ----------
+class SearchInput(BaseModel):
+    query: str = Field(..., description="Free-text query to match tasks/projects")
+
+class SearchHit(BaseModel):
+    id: str
+    title: str
+    text: str
+    url: str
+
+class SearchOutput(BaseModel):
+    __root__: List[SearchHit]
+
+class FetchInput(BaseModel):
+    id: str = Field(..., description="Use 'task:<id>' or 'project:<id>'")
+
+class FetchOutput(BaseModel):
+    id: str
+    title: str
+    text: str
+    url: str
+    metadata: Optional[Dict[str, Any]] = None
+
+# ---------- Helpers ----------
+def _safe(s: Optional[str]) -> str:
+    return s or ""
+
+def _task_url(task_id: str) -> str:
+    return f"https://todoist.com/showTask?id={task_id}"
+
+def _project_url(project_id: str) -> str:
+    return f"https://app.todoist.com/app/project/{project_id}"
+
+# ---------- Tool handlers ----------
+async def handle_search(data: SearchInput) -> List[SearchHit]:
+    """
+    Returns up to 10 mixed results across open tasks and projects.
+    - Tasks: /tasks?filter=<query> (Todoist filter syntax)
+    - Projects: client-side name contains query
+    """
+    q = data.query.strip()
+    # Quote multi-word queries to align with Todoist filter parsing
+    flt = q if " " not in q else f'"{q}"'
+
+    hits: Dict[str, SearchHit] = {}
+
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+        # Tasks (open)
+        r1 = await client.get(f"{BASE_URL}/tasks", params={"filter": flt})
+        r1.raise_for_status()
+        for t in r1.json():
+            tid = str(t["id"])
+            content = _safe(t.get("content"))
+            due = t.get("due", {}) or {}
+            pdue = due.get("date")
+            prio = t.get("priority")
+            labels = t.get("labels") or []
+            bits = []
+            if pdue:
+                bits.append(f"due {pdue}")
+            if prio:
+                bits.append(f"p{prio}")
+            if labels:
+                bits.append("labels:" + ",".join(labels))
+            text = content + (f"  ({'; '.join(bits)})" if bits else "")
+            hits[f"task:{tid}"] = SearchHit(
+                id=f"task:{tid}",
+                title=content or f"Task {tid}",
+                text=text,
+                url=_task_url(tid),
+            )
+
+        # Projects (name contains query)
+        r2 = await client.get(f"{BASE_URL}/projects")
+        r2.raise_for_status()
+        for p in r2.json():
+            pid = str(p["id"])
+            name = _safe(p.get("name"))
+            if q.lower() in name.lower():
+                hits[f"project:{pid}"] = SearchHit(
+                    id=f"project:{pid}",
+                    title=name or f"Project {pid}",
+                    text=name,
+                    url=_project_url(pid),
+                )
+
+    # Return at most 10 for snappy DR UX
+    return list(hits.values())[:10]
+
+async def handle_fetch(data: FetchInput) -> FetchOutput:
+    """
+    Fetch a single task or project by prefixed id.
+    """
+    if data.id.startswith("task:"):
+        tid = data.id.split(":", 1)[1]
+        async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+            r = await client.get(f"{BASE_URL}/tasks/{tid}")
+            r.raise_for_status()
+            t = r.json()
+        title = _safe(t.get("content"))
+        meta = {
+            "due": t.get("due"),
+            "priority": t.get("priority"),
+            "labels": t.get("labels"),
+            "project_id": t.get("project_id"),
+            "section_id": t.get("section_id"),
+            "completed": t.get("is_completed"),
+            "created_at": t.get("created_at"),
+            "url": _task_url(tid),
+        }
+        return FetchOutput(
+            id=f"task:{tid}",
+            title=title or f"Task {tid}",
+            text=title,
+            url=_task_url(tid),
+            metadata=meta,
+        )
+
+    if data.id.startswith("project:"):
+        pid = data.id.split(":", 1)[1]
+        async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+            r = await client.get(f"{BASE_URL}/projects/{pid}")
+            r.raise_for_status()
+            p = r.json()
+        name = _safe(p.get("name"))
+        meta = {
+            "color": p.get("color"),
+            "is_favorite": p.get("is_favorite"),
+            "view_style": p.get("view_style"),
+            "url": _project_url(pid),
+        }
+        return FetchOutput(
+            id=f"project:{pid}",
+            title=name or f"Project {pid}",
+            text=name,
+            url=_project_url(pid),
+            metadata=meta,
+        )
+
+    raise ValueError("id must start with 'task:' or 'project:'")
+
+# ---------- FastMCP app (SSE tools only) ----------
 app = FastMCP(
-    name="Todoist Deep-Research Connector",
-    instructions="Search and fetch Todoist tasks & projects using the Deep Research protocol",
-)
+    "todoist-mcp",
+    tools=[
+        Tool(
+            name="search",
+            description="Search Todoist tasks and projects by free-text query",
+            input_model=SearchInput,
+            output_model=SearchOutput,
+            handler=handle_search,
+            transport="sse",
+        ),
+        Tool(
+            name="fetch",
+            description="Fetch full details for a Todoist task or project",
+            input_model=FetchInput,
+            output_model=FetchOutput,
+            handler=handle_fetch,
+            transport="sse",
+        ),
+    ],
+).app  # FastAPI app
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Static file setup (manifest)
-# ──────────────────────────────────────────────────────────────────────────────
-
-STATIC_DIR = pathlib.Path("static")
-STATIC_DIR.mkdir(exist_ok=True)
-(STATIC_DIR / ".well-known").mkdir(parents=True, exist_ok=True)
-
-manifest = {
-    "schema_version": "v1",
-    "name_for_human": "Todoist MCP Connector",
-    "name_for_model": "todoist_mcp",
-    "description_for_human": "Search & fetch your Todoist tasks from ChatGPT.",
-    "description_for_model": "Provides `search` and `fetch` tools for Todoist data.",
-    "auth": {"type": "none"},
-    "api": {"type": "openapi", "url": "https://todoist-mcp-connector.fly.dev/openapi.yaml"},
-    "logo_url": "https://todoist-mcp-connector.fly.dev/logo.png",
-    "contact_email": "you@example.com",
-    "legal_info_url": "https://example.com/legal"
-}
-manifest_path = STATIC_DIR / ".well-known" / "ai-plugin.json"
-manifest_path.write_text(json.dumps(manifest, indent=2))
-
-# CORS so ChatGPT’s browser client can call the server
-app.fastapi_app.add_middleware(
+# CORS for ChatGPT browser client
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Route to serve the manifest
-@app.get("/.well-known/ai-plugin.json", include_in_schema=False)
-def serve_manifest():
-    return FileResponse(manifest_path)
+# Health route for Fly checks
+fastapi_app: FastAPI = app  # type: ignore
+@fastapi_app.get("/health")
+async def health():
+    return {"ok": True}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pydantic models (Deep‑Research spec)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class SearchRequest(BaseModel):
-    query: str = Field(..., description="Free‑text search string")
-
-
-class Snippet(BaseModel):
-    id: str
-    title: str
-    text: str   # ≈200‑char snippet
-    url: str
-
-
-class FetchRequest(BaseModel):
-    id: str = Field(..., description="Identifier returned from search")
-
-
-class Doc(BaseModel):
-    id: str
-    title: str
-    text: str   # full content
-    url: str
-    metadata: Optional[Dict] = None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-TODOIST_BASE = "https://api.todoist.com/rest/v2"
-
-
-def get_token_and_headers() -> Tuple[str, Dict[str, str]]:
-    token = os.getenv("TODOIST_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "TODOIST_TOKEN environment variable is missing. "
-            "Set it via fly secrets or your shell."
-        )
-    return token, {"Authorization": f"Bearer {token}"}
-
-
-async def http_get(
-    client: httpx.AsyncClient, url: str, headers: Dict[str, str], **params
-) -> dict:
-    resp = await client.get(url, headers=headers, timeout=10, params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def make_task_snippet(task: dict) -> Snippet:
-    title = task.get("content", "")
-    due_date = (task.get("due") or {}).get("date")
-    priority = task.get("priority")
-    snippet = title
-    parts = []
-    if due_date:
-        parts.append(f"due: {due_date}")
-    if priority:
-        parts.append(f"priority: {priority}")
-    if parts:
-        snippet += " (" + ", ".join(parts) + ")"
-    return Snippet(
-        id=f"task:{task['id']}",
-        title=title,
-        text=snippet[:200],
-        url=f"https://todoist.com/showTask?id={task['id']}",
-    )
-
-
-def make_project_snippet(project: dict) -> Snippet:
-    name = project.get("name", "")
-    return Snippet(
-        id=f"project:{project['id']}",
-        title=name,
-        text=("Project • " + name)[:200],
-        url=f"https://todoist.com/showProject?id={project['id']}",
-    )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Tool implementations
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.tool(
-    Tool(
-        name="search",
-        request=SearchRequest,
-        response=List[Snippet],
-        description="Search Todoist tasks and projects by free‑text query",
-    )
-)
-async def search(req: SearchRequest) -> List[Snippet]:
-    _, headers = get_token_and_headers()
-
-    query = req.query.strip()
-    if not query:
-        return []
-
-    results: List[Snippet] = []
-    seen_ids: Set[str] = set()
-
-    search_filter = f'search: "{query}"' if " " in query else f"search: {query}"
-
-    async with httpx.AsyncClient() as client:
-        tasks = await http_get(
-            client,
-            f"{TODOIST_BASE}/tasks",
-            headers,
-            filter=search_filter,
-        )
-        for task in tasks:
-            if len(results) >= 10:
-                break
-            snippet = make_task_snippet(task)
-            if snippet.id not in seen_ids:
-                results.append(snippet)
-                seen_ids.add(snippet.id)
-
-        if len(results) < 10:
-            projects = await http_get(client, f"{TODOIST_BASE}/projects", headers)
-            for project in projects:
-                if len(results) >= 10:
-                    break
-                if query.lower() in project.get("name", "").lower():
-                    snippet = make_project_snippet(project)
-                    if snippet.id not in seen_ids:
-                        results.append(snippet)
-                        seen_ids.add(snippet.id)
-
-    return results
-
-
-@app.tool(
-    Tool(
-        name="fetch",
-        request=FetchRequest,
-        response=Doc,
-        description="Fetch full detail for a Todoist task or project by id",
-    )
-)
-async def fetch(req: FetchRequest) -> Doc:
-    _, headers = get_token_and_headers()
-
-    try:
-        kind, raw_id = req.id.split(":", 1)
-    except ValueError:
-        raise ValueError("id must be in the format 'task:<id>' or 'project:<id>'")
-
-    async with httpx.AsyncClient() as client:
-        if kind == "task":
-            data = await http_get(client, f"{TODOIST_BASE}/tasks/{raw_id}", headers)
-            doc = Doc(
-                id=req.id,
-                title=data.get("content", ""),
-                text=data.get("content", ""),
-                url=f"https://todoist.com/showTask?id={raw_id}",
-                metadata={
-                    "due": data.get("due"),
-                    "priority": data.get("priority"),
-                    "labels": data.get("labels"),
-                    "project_id": data.get("project_id"),
-                },
-            )
-        elif kind == "project":
-            data = await http_get(client, f"{TODOIST_BASE}/projects/{raw_id}", headers)
-            doc = Doc(
-                id=req.id,
-                title=data.get("name", ""),
-                text=data.get("description") or data.get("name", ""),
-                url=f"https://todoist.com/showProject?id={raw_id}",
-                metadata={
-                    "color": data.get("color"),
-                    "comment_count": data.get("comment_count"),
-                },
-            )
-        else:
-            raise ValueError("Unknown resource type; id must start with 'task:' or 'project:'")
-
-    return doc
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Routes added AFTER tool registration
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.get("/openapi.yaml", include_in_schema=False)
-def serve_openapi():
-    """Generate OpenAPI after tools are registered."""
-    return PlainTextResponse(
-        yaml.safe_dump(app.fastapi_app.openapi(), sort_keys=False),
-        media_type="text/yaml"
-    )
-
-@app.get("/health")
-async def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Entrypoint
-# ──────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, transport="sse")
+# Uvicorn entrypoint for local dev is intentionally omitted (cloud-only)
