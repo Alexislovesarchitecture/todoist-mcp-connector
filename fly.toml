@@ -1,5 +1,10 @@
+# fly.toml app configuration file generated for todoist-mcp-connector on 2025-08-07T22:47:05Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'todoist-mcp-connector'
-primary_region = 'iad'
+primary_region = 'lax'
 
 [build]
 
