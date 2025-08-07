@@ -10,6 +10,5 @@ No OpenAPI manifest, no Actions/Plugin files — Deep Research calls the SSE rou
 ## Deploy (Fly.io)
 
 ```bash
-fly launch --no-deploy
 fly secrets set TODOIST_TOKEN=xxxxxxxxxxxxxxxxxxxx
 fly deploy

@@ -10,13 +10,12 @@ from pydantic import BaseModel, Field
 # ---------- Config ----------
 TODOIST_TOKEN = os.getenv("TODOIST_TOKEN")
 if not TODOIST_TOKEN:
-    # Fail fast in cloud so health checks surface a clear reason
     raise RuntimeError("Missing TODOIST_TOKEN environment variable")
 
 BASE_URL = "https://api.todoist.com/rest/v2"
 HEADERS = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
 
-# ---------- Models required by Deep Research ----------
+# ---------- Pydantic models required by Deep Research ----------
 class SearchInput(BaseModel):
     query: str = Field(..., description="Free-text query to match tasks/projects")
 
@@ -57,8 +56,7 @@ async def handle_search(data: SearchInput) -> List[SearchHit]:
     - Projects: client-side name contains query
     """
     q = data.query.strip()
-    # Quote multi-word queries to align with Todoist filter parsing
-    flt = q if " " not in q else f'"{q}"'
+    flt = q if " " not in q else f'"{q}"'  # quote multi-word queries
 
     hits: Dict[str, SearchHit] = {}
 
@@ -69,10 +67,11 @@ async def handle_search(data: SearchInput) -> List[SearchHit]:
         for t in r1.json():
             tid = str(t["id"])
             content = _safe(t.get("content"))
-            due = t.get("due", {}) or {}
+            due = (t.get("due") or {}) or {}
             pdue = due.get("date")
             prio = t.get("priority")
             labels = t.get("labels") or []
+
             bits = []
             if pdue:
                 bits.append(f"due {pdue}")
@@ -80,6 +79,7 @@ async def handle_search(data: SearchInput) -> List[SearchHit]:
                 bits.append(f"p{prio}")
             if labels:
                 bits.append("labels:" + ",".join(labels))
+
             text = content + (f"  ({'; '.join(bits)})" if bits else "")
             hits[f"task:{tid}"] = SearchHit(
                 id=f"task:{tid}",
@@ -102,7 +102,6 @@ async def handle_search(data: SearchInput) -> List[SearchHit]:
                     url=_project_url(pid),
                 )
 
-    # Return at most 10 for snappy DR UX
     return list(hits.values())[:10]
 
 async def handle_fetch(data: FetchInput) -> FetchOutput:
@@ -115,6 +114,7 @@ async def handle_fetch(data: FetchInput) -> FetchOutput:
             r = await client.get(f"{BASE_URL}/tasks/{tid}")
             r.raise_for_status()
             t = r.json()
+
         title = _safe(t.get("content"))
         meta = {
             "due": t.get("due"),
@@ -140,6 +140,7 @@ async def handle_fetch(data: FetchInput) -> FetchOutput:
             r = await client.get(f"{BASE_URL}/projects/{pid}")
             r.raise_for_status()
             p = r.json()
+
         name = _safe(p.get("name"))
         meta = {
             "color": p.get("color"),
@@ -193,5 +194,3 @@ fastapi_app: FastAPI = app  # type: ignore
 @fastapi_app.get("/health")
 async def health():
     return {"ok": True}
-
-# Uvicorn entrypoint for local dev is intentionally omitted (cloud-only)
